@@ -4,7 +4,7 @@ Repository for R scripts and reproducible analysis for T. circumcincta transcrip
 
 ## Overview
 
-This repository contains reproducible R scripts for generating publication-ready heatmaps from transcriptomic data for T. circumcincta across life stages and AMP-predicted peptide gene sets. The analyses are designed for consistent figure formatting and manuscript-ready export for molecular and cellular proteomics workflows.
+This repository contains reproducible R scripts for generating publication-ready heatmaps from transcriptomic data for T. circumcincta across life stages and AMP-predicted peptide gene sets. The analyses are designed for consistent figure formatting and export.
 
 ## Repository contents
 
@@ -33,7 +33,7 @@ The scripts expect a merged Excel file containing transcriptomic and AMP predict
 - gene identifier column: `gene_id`
 - log2FC columns such as `log2FoldChange_L3_v_xL3`, `log2FoldChange_xL3_v_L4`, etc.
 
-The input path is currently defined as a local Windows path in the scripts and should be adjusted to match your environment before running.
+The input path is currently defined as a local Windows path in the scripts and should be adjusted to match your environment before running. This data can be found at 10.5281/zenodo.23415056
 
 ## Usage
 
@@ -66,7 +66,7 @@ If you use these scripts in a publication, please cite the repository and the co
 
 Suggested citation:
 
-Aidan Tolhurst. T. circumcincta transcriptomic analysis. GitHub repository. https://github.com/AidanTolhurst/T-circumcincta-transcriptomic-analysis
+Blank for now
 
 ## License
 
