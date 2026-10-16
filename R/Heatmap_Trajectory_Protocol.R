@@ -5,19 +5,6 @@ library(ComplexHeatmap)
 library(circlize)
 library(grid)
 
-# ---- Input & reproducible naming helper (replaces absolute paths) ----
-# Accept CLI args (--input=, --row_filter=, --repro_tag=, --out_dir=) when run with Rscript,
-# or environment variables INPUT_FILE, ROW_FILTER, REPRO_TAG, OUT_DIR when run interactively.
-get_arg <- function(name, default = NULL) {
-  args <- commandArgs(trailingOnly = TRUE)
-  pat <- paste0("^--", name, "=")
-  arg <- grep(pat, args, value = TRUE)
-  if (length(arg)) return(sub(pat, "", arg[[1]]))
-  env <- Sys.getenv(toupper(name), unset = "")
-  if (nzchar(env)) return(env)
-  return(default)
-}
-
 default_input <- file.path("data", "merged_data.xlsx")
 default_row_filter <- 0
 
