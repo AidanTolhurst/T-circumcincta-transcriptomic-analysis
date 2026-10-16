@@ -6,7 +6,7 @@ library(circlize)
 library(grid)
 
 #Parameter definition
-INPUT_FILE <- "Data/merged_data.xlsx"  # output of the Python merge script
+INPUT_FILE <- ("data", "merged_data.xlsx")  # output of the Python merge script
 SHEET_NAME <- "Sheet1"
 ID_COL     <- "gene_id"
 
