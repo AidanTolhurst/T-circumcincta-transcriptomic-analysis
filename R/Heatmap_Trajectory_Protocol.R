@@ -5,14 +5,64 @@ library(ComplexHeatmap)
 library(circlize)
 library(grid)
 
-#Parameter definition
-INPUT_FILE <- "C:/Users/tolhu/OneDrive/Documents/Cantacessi_Research/Data/merged_data.xlsx"
+# ---- Input & reproducible naming helper (replaces absolute paths) ----
+# Accept CLI args (--input=, --row_filter=, --repro_tag=, --out_dir=) when run with Rscript,
+# or environment variables INPUT_FILE, ROW_FILTER, REPRO_TAG, OUT_DIR when run interactively.
+get_arg <- function(name, default = NULL) {
+  args <- commandArgs(trailingOnly = TRUE)
+  pat <- paste0("^--", name, "=")
+  arg <- grep(pat, args, value = TRUE)
+  if (length(arg)) return(sub(pat, "", arg[[1]]))
+  env <- Sys.getenv(toupper(name), unset = "")
+  if (nzchar(env)) return(env)
+  return(default)
+}
+
+default_input <- file.path("data", "merged_data.xlsx")
+default_row_filter <- 0
+
+INPUT_FILE <- normalizePath(get_arg("input", default_input), winslash = "/", mustWork = FALSE)
+ROW_FILTER_THRESHOLD <- as.numeric(get_arg("row_filter", as.character(default_row_filter)))
+REPRO_TAG <- get_arg("repro_tag", "")
+OUT_DIR <- get_arg("out_dir", "results")
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(INPUT_FILE)) {
+  stop(sprintf(
+    "Input file not found: %s\nPlace your merged input at '%s' (relative to the repository root) or pass --input=/path/to/file.xlsx",
+    INPUT_FILE, default_input
+  ))
+}
+
+# auto-generate tag if not provided: UTC timestamp + git short SHA (if available)
+if (REPRO_TAG == "") {
+  git_sha <- tryCatch(system("git rev-parse --short HEAD", intern = TRUE), error = function(e) character(0))
+  git_sha <- if (length(git_sha) == 0) NULL else git_sha
+  timestamp <- format(Sys.time(), "%Y%m%dT%H%M%SZ", tz = "UTC")
+  .tag <- if (!is.null(git_sha)) paste0(timestamp, "_", git_sha) else timestamp
+} else {
+  .tag <- REPRO_TAG
+}
+
+# derive output from input basename so file names are reproducible and traceable
+input_basename <- tools::file_path_sans_ext(basename(INPUT_FILE))
+OUTPUT_FILE <- file.path(OUT_DIR, paste0("Heatmap_trajectory_", input_basename, "_rowfilter", ROW_FILTER_THRESHOLD, "_", .tag, ".pdf"))
+
+cat("Settings:\n")
+cat("  INPUT_FILE           =", INPUT_FILE, "\n")
+cat("  ROW_FILTER_THRESHOLD =", ROW_FILTER_THRESHOLD, "\n")
+cat("  OUT_DIR              =", OUT_DIR, "\n")
+cat("  REPRO tag            =", .tag, "\n")
+cat("  OUTPUT_FILE          =", OUTPUT_FILE, "\n\n")
+# ---------------------------------------------------------------------
+
 SHEET_NAME <- "Sheet1"
 ID_COL     <- "gene_id"
 
 # AMP-specific predictor scores used to decide which genes are plotted
 AMP_PREDICTOR_COLS  <- c("ampir prob_AMP", "multipep antimicrobial", "multipep antibacterial")
-ROW_FILTER_THRESHOLD <- 0
+ROW_FILTER_THRESHOLD <- ROW_FILTER_THRESHOLD
 
 SIGN_FLIP <- c(
   L3_v_xL3     = 1,
@@ -25,10 +75,7 @@ STAGE_ORDER  <- c("L3", "xL3", "L4", "aMale", "aFemale")
 Z_SCORE_ROWS <- TRUE
 
 PLOT_TITLE  <- "Relative expression trajectory of\n AMP-predicted peptides across life stages"
-OUTPUT_FILE <- "Heatmap_expression_trajectory.pdf"   # vector primary output - MCP prefers EPS/PDF for line art
 
-# --- MCP figure-formatting parameters (journal guide-for-authors: "Figures, images and
-#     other artwork" / "Figure dimensions and labeling") - same constants as Heatmap_Protocol.r
 FONT_FAMILY <- "Helvetica"                                          # journal-recommended font
 STANDARD_COLUMN_WIDTHS_IN <- c("1 column" = 3.5, "1.5 column" = 5, "2 column" = 7.2)
 MAX_FIGURE_HEIGHT_IN <- 6            # MCP's hard cap on figure height
