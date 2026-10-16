@@ -34,7 +34,7 @@ if (REPRO_TAG == "") {
 } else {
   .tag <- REPRO_TAG
 }
-OUTPUT_FILE <- paste0("Heatmap_rowfilter", ROW_FILTER_THRESHOLD, "_", .tag, ".pdf")
+OUTPUT_FILE <- paste0("Heatmap_pairwise_rowfilter", ROW_FILTER_THRESHOLD, "_", .tag, ".pdf")
 
 FONT_FAMILY <- "Helvetica"     
 
