@@ -5,7 +5,7 @@ library(ComplexHeatmap)
 library(circlize)
 library(grid)
 
-default_input <- file.path("data", "merged_data.xlsx")
+INPUT_FILE <- file.path("data", "merged_data.xlsx")
 SHEET_NAME <- "Sheet1"
 ID_COL     <- "gene_id"
 
