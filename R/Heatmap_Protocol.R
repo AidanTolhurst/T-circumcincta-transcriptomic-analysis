@@ -22,7 +22,19 @@ PREDICTOR_THRESHOLD <- 0  #Threshold for marking, 0 to allow for all retrieved v
 ROW_FILTER_THRESHOLD <- 0.9  # Threshold for gene inclusion
 
 PLOT_TITLE  <- "Pairwise comparison of transcriptomics across life stages of T. circumcincta"
-OUTPUT_FILE <- "Heatmap_0.9.pdf" 
+
+# Reproducible output filenames: controlled by environment variable REPRO_TAG or auto-generated
+# tag uses UTC timestamp and, when available, the current git commit short SHA.
+REPRO_TAG <- Sys.getenv("REPRO_TAG", unset = "")
+.git_sha <- tryCatch(system("git rev-parse --short HEAD", intern = TRUE), error = function(e) character(0))
+.git_sha <- if (length(.git_sha) == 0) NULL else .git_sha
+if (REPRO_TAG == "") {
+  .timestamp <- format(Sys.time(), "%Y%m%dT%H%M%SZ", tz = "UTC")
+  .tag <- if (!is.null(.git_sha)) paste0(.timestamp, "_", .git_sha) else .timestamp
+} else {
+  .tag <- REPRO_TAG
+}
+OUTPUT_FILE <- paste0("Heatmap_rowfilter", ROW_FILTER_THRESHOLD, "_", .tag, ".pdf")
 
 FONT_FAMILY <- "Helvetica"     
 
