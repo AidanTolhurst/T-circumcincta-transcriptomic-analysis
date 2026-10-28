@@ -1,0 +1,785 @@
+#!/usr/bin/env python3
+"""
+peptide_mapper.py - map short peptides by exact matching instead of BLAST.
+
+Implements:
+  1. Exact string matching (I and L treated as equivalent) against
+       - a predicted proteome (protein FASTA)
+       - a six-frame translation of a genome assembly (nucleotide FASTA)
+  2. Significance from database size (expected random matches), plus an
+     empirical null from reversed and shuffled copies of every peptide that go
+     through the identical search.
+  3. Structural context of each hit (flanking cleavage sites, C-terminal G
+     for amidation, crude signal-peptide-like N-terminus).
+  4. Host background check (e.g. the sheep proteome).
+
+Usage
+-----
+  python peptide_mapper.py AASequences.csv \
+      --proteome Tcirc.proteins.fa \
+      --genome   Tcirc.assembly.fa \
+      --host-proteome Ovis_aries.proteins.fa \
+      --n-shuffles 100 --out tcirc_map
+
+Peptide input: a CSV/text file with a header called "pepseq" and one peptide
+per row. Peptides have no names in the file, so each is named after its row
+number in the file: the first peptide under the header (row 2) is "pep_row2",
+and so on. That makes every hit traceable straight back to your spreadsheet.
+(If a row has a second column, that is used as the name instead. A FASTA file
+is also accepted.) Plain or .gz files are fine for every input.
+
+Outputs
+-------
+  <out>.hits.tsv             one row per exact hit (real peptides only)
+  <out>.peptide_summary.tsv  one row per peptide, per-database statistics
+  <out>.null_by_length.tsv   real vs reversed vs shuffled hit rates by length
+  <out>.run_info.txt         inputs (size + SHA-256), settings, versions, data notes
+
+Requires: Python 3.8+ and numpy. Peptides must use the 20 standard residues.
+Peptides longer than 12 residues are supported (see Searcher).
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import csv
+import datetime
+import gzip
+import hashlib
+import io
+import math
+import os
+import platform
+import random
+import re
+import sys
+import zipfile
+from collections import defaultdict
+from dataclasses import dataclass
+
+import numpy as np
+
+# ==========================================================================
+# SETTINGS FOR IDLE - edit these, save, then press F5
+# ==========================================================================
+DATA = r"C:\Users\tolhu\OneDrive\Documents\Cantacessi_Research\Data"
+
+PEPTIDES = DATA + r"\AASequences.csv"      # CSV with a 'pepseq' column
+
+PROTEOME = DATA + r"\Nematoda.proteins.fa"                  # all-nematode proteins
+GENOME = DATA + r"\teladorsagia_circumcincta.genome.fa"     # T. circumcincta genome
+HOST_PROTEOME = DATA + r"\Ovis_aries.proteins.fa"           # sheep proteins
+
+OUT = DATA + r"\nematoda_map"              # output files start with this
+N_SHUFFLES = 100                           # shuffled decoys per peptide
+
+# --------------------------------------------------------------------------
+# DATA PROVENANCE - fill these in. They are copied into <OUT>.run_info.txt
+# next to the results, together with each input file's size and SHA-256
+# checksum, so every output records exactly which data produced it.
+# Only write what you can confirm from the files you actually used.
+# --------------------------------------------------------------------------
+ZENODO_DOI = "10.5281/zenodo.XXXXXXX"      # Zenodo record holding the data
+DATA_NOTES = {
+    "peptides": "This study; pepseq column; see Zenodo record",
+    "proteome": "UniProt, query taxonomy_id:6231; release [XXXX_XX]; "
+                "downloaded [date]",
+    "genome":   "[source]; assembly [accession]; release [version]; "
+                "downloaded [date]",
+    "host":     "UniProt, query taxonomy_id:9940; release [XXXX_XX]; "
+                "downloaded [date]",
+}
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+STANDARD_AA = set("ACDEFGHIKLMNPQRSTVWY")
+IL_BYTES = bytes.maketrans(b"I", b"L")          # I -> L equivalence
+
+# After I->L merging there are 19 distinct letters; code each in 5 bits so up
+# to 12 residues fit in one uint64 key.
+KEY_ALPHABET = "ACDEFGHKLMNPQRSTVWY"
+KEY_BITS = 5
+MAX_K = 12
+AA_CODE = np.zeros(256, dtype=np.uint8)         # 0 = anything else ('*', 'X')
+for _i, _ch in enumerate(KEY_ALPHABET, start=1):
+    AA_CODE[ord(_ch)] = _i
+CODE_OF = {ch: i for i, ch in enumerate(KEY_ALPHABET, start=1)}
+
+PRE_BITS = 24                                   # cheap pre-filter table size
+PRE_MASK = np.uint64((1 << PRE_BITS) - 1)
+CHUNK = 8_000_000                               # windows scanned per block
+
+# Nucleotide coding T,C,A,G = 0,1,2,3 so the standard code string below
+# (TCAG order) can be indexed as 16*b1 + 4*b2 + b3. Complement = (x + 2) % 4.
+NT_CODE = np.full(256, 4, dtype=np.uint8)
+for _v, _b in enumerate("TCAG"):
+    NT_CODE[ord(_b)] = _v
+    NT_CODE[ord(_b.lower())] = _v
+CODON_AA = np.frombuffer(
+    b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    dtype=np.uint8,
+)
+
+# Processing-site motifs used for structural context (edit to taste).
+DIBASIC = {"KR", "RR"}                          # add "KK", "RK" if desired
+
+# Kyte-Doolittle hydropathy for the crude signal-peptide heuristic.
+KD = {"A": 1.8, "R": -4.5, "N": -3.5, "D": -3.5, "C": 2.5, "Q": -3.5,
+      "E": -3.5, "G": -0.4, "H": -3.2, "I": 4.5, "L": 3.8, "K": -3.9,
+      "M": 1.9, "F": 2.8, "P": -1.6, "S": -0.8, "T": -0.7, "W": -0.9,
+      "Y": -1.3, "V": 4.2}
+
+HIT_FIELDS = [
+    "database", "peptide_id", "peptide", "length", "subject", "strand",
+    "frame", "aa_start", "aa_end", "nt_start", "nt_end", "matched_seq",
+    "il_variant", "upstream", "downstream", "n_site", "c_site",
+    "amidation_signal", "signal_like_nterm", "precursor_len",
+    "context_support",
+]
+
+
+# --------------------------------------------------------------------------
+# I/O helpers
+# --------------------------------------------------------------------------
+def open_text(path):
+    """Open a text file, detecting zip, gzip and UTF-16 from the file's first
+    bytes (not its name). Plain files are read as UTF-8; utf-8-sig strips the
+    invisible byte-order mark Excel adds to 'CSV UTF-8' files, and any stray
+    undecodable byte becomes a replacement character instead of a crash."""
+    with open(path, "rb") as fh:
+        magic = fh.read(2)
+    if magic == b"PK":                               # zip (e.g. NCBI Datasets)
+        zf = zipfile.ZipFile(path)
+        wanted = (".faa", ".fa", ".fasta", ".fna", ".fas")
+        members = [m for m in zf.namelist() if m.lower().endswith(wanted)]
+        if len(members) != 1:
+            sys.exit(f"{path} is a zip archive and I need exactly one FASTA "
+                     f"file inside it; found {members or 'none'} among "
+                     f"{zf.namelist()[:10]}. Unzip it and point the script at "
+                     "the right file.")
+        print(f"[note] reading {members[0]} from inside the zip {path}",
+              file=sys.stderr)
+        return io.TextIOWrapper(zf.open(members[0]), encoding="utf-8-sig",
+                                errors="replace")
+    if magic == b"\x1f\x8b":                         # gzip, whatever it is named
+        return gzip.open(path, "rt", encoding="utf-8-sig", errors="replace")
+    if magic in (b"\xff\xfe", b"\xfe\xff"):          # UTF-16 (e.g. PowerShell)
+        return open(path, encoding="utf-16", errors="replace")
+    return open(path, encoding="utf-8-sig", errors="replace")
+
+
+def read_fasta(path):
+    """Yield (name, sequence) from a plain or gzipped FASTA file."""
+    name, chunks, first = None, [], True
+    with open_text(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if first:
+                first = False
+                if line[0] != ">":
+                    sys.exit(f"{path} does not look like a FASTA file: the "
+                             f"first line starts {line[:40]!r}. Open it in a "
+                             "text editor and check the download.")
+            if line[0] == ">":
+                if name is not None:
+                    yield name, "".join(chunks)
+                parts = line[1:].split()
+                name, chunks = (parts[0] if parts else ""), []
+            else:
+                chunks.append(line)
+    if name is not None:
+        yield name, "".join(chunks)
+
+
+def check_fasta(path, kind):
+    """Cheap sanity check of a database file, run for every database before
+    the long searches start, so a bad file fails in seconds, not hours."""
+    residues, n, first = [], 0, True
+    with open_text(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if first:
+                first = False
+                if line[0] != ">":
+                    sys.exit(f"{path} does not look like a FASTA file: the "
+                             f"first line starts {line[:40]!r}.")
+                continue
+            if line[0] == ">":
+                continue
+            residues.append(line.upper())
+            n += len(line)
+            if n >= 5000:
+                break
+    seq = "".join(residues)
+    if not seq:
+        sys.exit(f"{path} has no sequence under its first header.")
+    nt_frac = sum(seq.count(c) for c in "ACGTUN") / len(seq)
+    if kind == "protein" and nt_frac > 0.95:
+        sys.exit(f"{path} looks like DNA, not protein. Use a protein FASTA "
+                 "here (put genome files under GENOME).")
+    if kind == "dna" and nt_frac < 0.8:
+        sys.exit(f"{path} looks like protein, not DNA. Use a nucleotide "
+                 "FASTA for GENOME.")
+
+
+@dataclass
+class Query:
+    qid: int
+    name: str
+    seq: str
+    kind: str          # "real", "reverse" or "shuffle"
+    parent: int        # qid of the real peptide this was derived from
+    rep: int = 0       # shuffle replicate number
+
+    @property
+    def norm(self) -> str:
+        return self.seq.replace("I", "L")
+
+
+def read_peptide_table(path, column):
+    """Read a CSV/text file with a header (default 'pepseq') and one peptide
+    per row. Returns (name, sequence) pairs, where the name is the row number
+    in the file ('pep_row2' = the first peptide under the header)."""
+    with open_text(path) as fh:
+        raw = fh.read().splitlines()
+
+    # Find the header row: the first non-blank line.
+    first = next((i for i, ln in enumerate(raw) if ln.strip()), None)
+    if first is None:
+        return []
+    def squash(text):                  # 'Pep_Seq', 'pep seq' -> 'pepseq'
+        return re.sub(r"[\W_]+", "", text.lower())
+
+    head_cells = [squash(c) for c in re.split(r"[,;\t]", raw[first])]
+    has_header = squash(column) in head_cells
+    col = head_cells.index(squash(column)) if has_header else 0
+    start = first + 1 if has_header else first
+
+    entries = []
+    for i in range(start, len(raw)):
+        line = raw[i].strip()
+        if not line:
+            continue
+        cells = [c.strip().strip('"') for c in re.split(r"[,;\t]", line)]
+        seq = cells[col] if col < len(cells) else ""
+        if not seq:
+            continue
+        # Use a second column as the name if one exists, otherwise the row.
+        extra = [c for j, c in enumerate(cells) if j != col and c]
+        name = extra[0] if extra else f"pep_row{i + 1}"
+        entries.append((name, seq))
+    return entries
+
+
+def load_peptides(path, column="pepseq"):
+    with open_text(path) as fh:
+        head = fh.readline()
+    if head.lstrip().startswith(">"):
+        entries = list(read_fasta(path))
+    else:
+        entries = read_peptide_table(path, column)
+
+    peptides = []
+    for name, seq in entries:
+        seq = seq.upper().strip().strip("*")
+        bad = set(seq) - STANDARD_AA
+        if not seq or bad:
+            print(f"[warn] skipping {name!r}: unusable residues {sorted(bad)}",
+                  file=sys.stderr)
+            continue
+        if len(seq) < 6:
+            print(f"[warn] {name!r} is only {len(seq)} residues; expect many "
+                  "chance matches", file=sys.stderr)
+        peptides.append(Query(len(peptides), name, seq, "real", len(peptides)))
+    return peptides
+
+
+def make_decoys(real, n_shuffles, seed):
+    """Reversed and shuffled copies; each preserves length and composition."""
+    rng = random.Random(seed)
+    real_norms = {p.norm for p in real}
+    decoys, skipped = [], 0
+
+    def add(seq, kind, parent, rep):
+        decoys.append(Query(len(real) + len(decoys),
+                            f"{kind}:{real[parent].name}", seq, kind, parent, rep))
+
+    for p in real:
+        rev = p.seq[::-1]
+        if rev.replace("I", "L") in real_norms:     # palindrome / equals a real
+            skipped += 1
+        else:
+            add(rev, "reverse", p.qid, 0)
+        for r in range(n_shuffles):
+            for _ in range(50):
+                letters = list(p.seq)
+                rng.shuffle(letters)
+                s = "".join(letters)
+                if s.replace("I", "L") not in real_norms:
+                    break
+            else:                                   # e.g. low-complexity peptide
+                skipped += 1
+                continue
+            add(s, "shuffle", p.qid, r)
+    return decoys, skipped
+
+
+# --------------------------------------------------------------------------
+# Structural context of a hit
+# --------------------------------------------------------------------------
+def signal_like(segment: str, hit_offset: int) -> bool:
+    """Crude check: hydrophobic stretch in the first 35 residues after the
+    first Met, with the peptide lying downstream. Heuristic only - use
+    SignalP / DeepTMHMM for anything you report."""
+    m = segment.find("M")
+    if m == -1 or hit_offset - m < 20:
+        return False
+    region = segment[m:m + 35]
+    vals = [KD.get(c, 0.0) for c in region]
+    return any(sum(vals[i:i + 8]) / 8 >= 1.6 for i in range(3, len(vals) - 7))
+
+
+def hit_context(hay: str, s: int, e: int, flank: int = 4) -> dict:
+    """Context for hay[s:e]. 'hay' is a protein, or one translated frame in
+    which '*' marks stops; the surrounding stop-to-stop stretch is treated as
+    the precursor."""
+    seg_start = hay.rfind("*", 0, s) + 1
+    stop = hay.find("*", e)
+    seg_end = len(hay) if stop == -1 else stop
+    up = hay[max(seg_start, s - flank):s]
+    down = hay[e:min(seg_end, e + flank)]
+
+    if s == seg_start:
+        n_site = "segment_start"
+    elif up[-2:] in DIBASIC:
+        n_site = "dibasic"
+    elif up[-1:] in ("K", "R"):
+        n_site = "monobasic"
+    else:
+        n_site = "none"
+
+    if e == seg_end:
+        c_site = "segment_end"
+    elif down[:2] in DIBASIC:
+        c_site = "dibasic"
+    elif down[:1] in ("K", "R"):
+        c_site = "monobasic"
+    else:
+        c_site = "none"
+
+    # Amidated peptides: the precursor carries a Gly right after the peptide,
+    # followed by a processing site.
+    if down[:1] == "G":
+        if down[1:3] in DIBASIC:
+            amid = "G+dibasic"
+        elif down[1:2] in ("K", "R"):
+            amid = "G+monobasic"
+        else:
+            amid = "G"
+    else:
+        amid = "none"
+
+    sig = signal_like(hay[seg_start:seg_end], s - seg_start)
+    support = (
+        (n_site in ("dibasic", "monobasic"))
+        + (c_site in ("dibasic", "monobasic") or amid in ("G+dibasic", "G+monobasic"))
+        + sig
+    )
+    return {"upstream": up, "downstream": down, "n_site": n_site,
+            "c_site": c_site, "amidation_signal": amid,
+            "signal_like_nterm": sig, "precursor_len": seg_end - seg_start,
+            "context_support": support}
+
+
+# --------------------------------------------------------------------------
+# Exact-match search engine
+# --------------------------------------------------------------------------
+def encode_key(s: str) -> int:
+    v = 0
+    for ch in s:
+        v = (v << KEY_BITS) | CODE_OF[ch]
+    return v
+
+
+class Searcher:
+    """Finds every exact occurrence of every query (reals and decoys) in one
+    pass per database.
+
+    Each residue is coded in 5 bits, so a k-residue window becomes one uint64
+    key. A cheap lookup table discards almost all windows, and the survivors
+    are checked with a binary search. Peptides longer than 12 residues use
+    their first 12 residues as the key and are then verified in full.
+    """
+
+    def __init__(self, queries, max_hits):
+        self.queries = queries
+        self.max_hits = max_hits
+        self.counts = np.zeros(len(queries), dtype=np.int64)
+        self.stored = defaultdict(int)
+        self.rows = []
+        self.comp = defaultdict(int)         # residue counts (I merged into L)
+        self.positions = 0
+
+        by_k = defaultdict(lambda: defaultdict(list))
+        for q in queries:
+            k = min(len(q.norm), MAX_K)
+            by_k[k][encode_key(q.norm[:k])].append(q.qid)
+        self.tables = {}
+        for k, d in by_k.items():
+            ordered = sorted(d)
+            keys = np.array(ordered, dtype=np.uint64)
+            table = np.zeros(1 << PRE_BITS, dtype=bool)
+            table[(keys & PRE_MASK).astype(np.intp)] = True
+            self.tables[k] = (keys, [d[x] for x in ordered], table)
+
+    def _iter_hits(self, norm, codes):
+        for k, (keys, qlists, table) in self.tables.items():
+            nwin = len(codes) - k + 1
+            for off in range(0, nwin, CHUNK):
+                w = min(CHUNK, nwin - off)
+                block = codes[off:off + w + k - 1]
+                key = np.zeros(w, dtype=np.uint64)
+                for j in range(k):
+                    key <<= np.uint64(KEY_BITS)
+                    key |= block[j:j + w]
+                cand = np.flatnonzero(table[(key & PRE_MASK).astype(np.intp)])
+                if cand.size == 0:
+                    continue
+                ck = key[cand]
+                idx = np.minimum(np.searchsorted(keys, ck), len(keys) - 1)
+                ok = keys[idx] == ck
+                for p, i in zip(cand[ok].tolist(), idx[ok].tolist()):
+                    pos = off + p
+                    for qi in qlists[i]:
+                        n = len(self.queries[qi].norm)
+                        if n > k and norm[pos:pos + n] != self.queries[qi].norm:
+                            continue
+                        yield qi, pos
+
+    def scan(self, norm: str, locate, flank: int):
+        """norm: sequence with I->L; locate(pos, n) -> (fields, orig, s, e)."""
+        for ch in KEY_ALPHABET:
+            self.comp[ch] += norm.count(ch)
+        self.positions += len(norm)
+        codes = AA_CODE[np.frombuffer(norm.encode("ascii", "replace"), dtype=np.uint8)]
+
+        for qi, pos in self._iter_hits(norm, codes):
+            self.counts[qi] += 1
+            q = self.queries[qi]
+            if q.kind != "real" or self.stored[qi] >= self.max_hits:
+                continue                      # decoys are only counted
+            self.stored[qi] += 1
+            fields, hay, s, e = locate(pos, len(q.norm))
+            row = {"peptide_id": q.name, "peptide": q.seq, "length": len(q.seq),
+                   **fields, "matched_seq": hay[s:e],
+                   "il_variant": hay[s:e] != q.seq, "_qid": q.qid}
+            row.update(hit_context(hay, s, e, flank))
+            self.rows.append(row)
+
+    def expected(self, q: Query):
+        """(composition-aware, naive 20^-n) expected random matches."""
+        total = max(sum(self.comp.values()), 1)
+        p = 1.0
+        for ch in q.norm:
+            p *= self.comp[ch] / total
+        return self.positions * p, self.positions * 20.0 ** -len(q.seq)
+
+
+# --------------------------------------------------------------------------
+# Databases
+# --------------------------------------------------------------------------
+def search_proteome(path, searcher, flank):
+    names, seqs = [], []
+    for name, seq in read_fasta(path):
+        names.append(name)
+        seqs.append(seq.upper().rstrip("*"))
+    starts, total = [], 0
+    for s in seqs:
+        starts.append(total)
+        total += len(s) + 1
+    norm = "*".join(seqs).replace("I", "L")   # '*' separators cannot match
+
+    def locate(pos, n):
+        i = bisect.bisect_right(starts, pos) - 1
+        off = pos - starts[i]
+        return ({"subject": names[i], "strand": ".", "frame": "",
+                 "aa_start": off + 1, "aa_end": off + n}, seqs[i], off, off + n)
+
+    searcher.scan(norm, locate, flank)
+    return len(seqs)
+
+
+def six_frame_translate(dna: str):
+    """Yield (strand, frame0, aa_bytes) for the six frames (standard code;
+    codons with ambiguous bases become X)."""
+    nt = NT_CODE[np.frombuffer(dna.encode("ascii", "replace"), dtype=np.uint8)]
+    rc = nt[::-1].copy()
+    known = rc < 4
+    rc[known] = (rc[known] + 2) % 4
+    for strand, arr in (("+", nt), ("-", rc)):
+        for frame in range(3):
+            n = (len(arr) - frame) // 3
+            if n <= 0:
+                continue
+            tri = arr[frame:frame + 3 * n].reshape(n, 3)
+            amb = (tri > 3).any(axis=1)
+            idx = ((tri[:, 0].astype(np.int16) << 4)
+                   | (tri[:, 1].astype(np.int16) << 2) | tri[:, 2])
+            idx[amb] = 0
+            aa = CODON_AA[idx]
+            aa[amb] = ord("X")
+            yield strand, frame, aa.tobytes()
+
+
+def search_genome(path, searcher, flank):
+    n_contigs = 0
+    for name, dna in read_fasta(path):
+        n_contigs += 1
+        L = len(dna)
+        for strand, frame, aa_bytes in six_frame_translate(dna):
+            orig = aa_bytes.decode("ascii")
+            norm = aa_bytes.translate(IL_BYTES).decode("ascii")
+
+            def locate(pos, n):
+                s0 = frame + 3 * pos                  # 0-based, on this strand
+                if strand == "+":
+                    nt_start, nt_end = s0 + 1, s0 + 3 * n
+                else:                                 # back to forward coords
+                    nt_start, nt_end = L - (s0 + 3 * n) + 1, L - s0
+                return ({"subject": name, "strand": strand,
+                         "frame": f"{strand}{frame + 1}",
+                         "aa_start": pos + 1, "aa_end": pos + n,
+                         "nt_start": nt_start, "nt_end": nt_end},
+                        orig, pos, pos + n)
+
+            searcher.scan(norm, locate, flank)
+    return n_contigs
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+def write_tsv(path, rows, fields):
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t",
+                           extrasaction="ignore", restval="")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def null_table(db, queries, counts):
+    """Hit rates of real vs reversed vs shuffled peptides, by length."""
+    rows = []
+    lengths = sorted({len(q.seq) for q in queries if q.kind == "real"})
+    for L in lengths + ["all"]:
+        def sel(q):
+            return L == "all" or len(q.seq) == L
+        real = [counts[q.qid] > 0 for q in queries if q.kind == "real" and sel(q)]
+        rev = [counts[q.qid] > 0 for q in queries if q.kind == "reverse" and sel(q)]
+        by_rep = defaultdict(list)
+        for q in queries:
+            if q.kind == "shuffle" and sel(q):
+                by_rep[q.rep].append(counts[q.qid] > 0)
+        shuf = [float(np.mean(v)) for v in by_rep.values()]
+        rows.append({
+            "database": db, "length": L, "n_peptides": len(real),
+            "real_hit_rate": round(float(np.mean(real)), 4) if real else "",
+            "reverse_hit_rate": round(float(np.mean(rev)), 4) if rev else "",
+            "shuffle_hit_rate_mean": round(float(np.mean(shuf)), 4) if shuf else "",
+            "shuffle_hit_rate_min": round(min(shuf), 4) if shuf else "",
+            "shuffle_hit_rate_max": round(max(shuf), 4) if shuf else "",
+        })
+    return rows
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 24), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def write_run_info(path, args, inputs, seq_counts, searchers, n_real, n_decoys):
+    """Record exactly what produced these results: inputs (with checksums),
+    settings, versions and database sizes."""
+    lines = [
+        "peptide_mapper run information",
+        f"date (UTC):      {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M}",
+        f"script:          {os.path.basename(sys.argv[0]) or 'pBlast.py'}",
+        f"python / numpy:  {platform.python_version()} / {np.__version__}",
+        f"data on Zenodo:  {ZENODO_DOI}",
+        "",
+        f"peptides searched: {n_real}  (+ {n_decoys} decoys)",
+        f"shuffles per peptide: {args.n_shuffles}   seed: {args.seed}   "
+        f"max hits: {args.max_hits}   flank: {args.flank}",
+        "",
+        "Inputs",
+    ]
+    for role, fpath in inputs:
+        print(f"[info] checksumming {fpath} ...", file=sys.stderr)
+        lines += [
+            f"- {role}: {os.path.basename(fpath)}",
+            f"    size:   {os.path.getsize(fpath):,} bytes",
+            f"    sha256: {sha256_of(fpath)}",
+            f"    note:   {DATA_NOTES.get(role, '')}",
+        ]
+        if role in searchers:
+            lines.append(f"    searched: {seq_counts[role]:,} sequences, "
+                         f"{searchers[role].positions:,} positions")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("peptides", help="CSV with a 'pepseq' column, or FASTA")
+    ap.add_argument("--column", default="pepseq",
+                    help="header of the peptide column in a CSV (default pepseq)")
+    ap.add_argument("--proteome", help="predicted proteome (protein FASTA)")
+    ap.add_argument("--genome", help="genome assembly (nucleotide FASTA)")
+    ap.add_argument("--host-proteome", help="host proteome, e.g. Ovis aries")
+    ap.add_argument("--n-shuffles", type=int, default=100,
+                    help="shuffled decoys per peptide (default 100; 0 = none)")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--max-hits", type=int, default=1000,
+                    help="max hit rows stored per peptide per database")
+    ap.add_argument("--flank", type=int, default=4,
+                    help="flanking residues reported either side of a hit")
+    ap.add_argument("--out", default="peptide_mapping", help="output prefix")
+    if len(sys.argv) == 1:          # run from IDLE: use the settings above
+        argv = [PEPTIDES, "--out", OUT, "--n-shuffles", str(N_SHUFFLES)]
+        for flag, path in (("--proteome", PROTEOME), ("--genome", GENOME),
+                           ("--host-proteome", HOST_PROTEOME)):
+            if path:
+                argv += [flag, path]
+        files = [PEPTIDES] + [p for p in (PROTEOME, GENOME, HOST_PROTEOME) if p]
+        missing = [f for f in files if not os.path.exists(f)]
+        if missing:
+            sys.exit("File(s) not found: " + "; ".join(missing))
+        if not (PROTEOME or GENOME or HOST_PROTEOME):
+            sys.exit("Set PROTEOME, GENOME and/or HOST_PROTEOME at the top of "
+                     "the script first (they are currently None).")
+        sys.argv += argv
+    args = ap.parse_args()
+
+    dbs = [("proteome", args.proteome, search_proteome),
+           ("genome", args.genome, search_genome),
+           ("host", args.host_proteome, search_proteome)]
+    dbs = [(n, p, f) for n, p, f in dbs if p]
+    if not dbs:
+        ap.error("give at least one of --proteome / --genome / --host-proteome")
+
+    for _name, _path, _func in dbs:
+        check_fasta(_path, "dna" if _func is search_genome else "protein")
+
+    real = load_peptides(args.peptides, args.column)
+    if not real:
+        sys.exit("no usable peptides")
+    decoys, skipped = make_decoys(real, args.n_shuffles, args.seed)
+    queries = real + decoys
+    print(f"{len(real)} peptides, {len(decoys)} decoys "
+          f"({skipped} decoys skipped: palindromic/low-complexity)",
+          file=sys.stderr)
+
+    searchers, seq_counts = {}, {}
+    for name, path, func in dbs:
+        print(f"[{name}] searching {path} ...", file=sys.stderr)
+        s = Searcher(queries, args.max_hits)
+        n = func(path, s, args.flank)
+        print(f"[{name}] {n} sequences, {s.positions:,} positions searched",
+              file=sys.stderr)
+        searchers[name] = s
+        seq_counts[name] = n
+
+    # ---- hits table
+    hit_rows = []
+    for name, s in searchers.items():
+        for r in s.rows:
+            hit_rows.append({"database": name, **r})
+    write_tsv(f"{args.out}.hits.tsv", hit_rows, HIT_FIELDS)
+
+    # ---- per-peptide summary
+    shuffles_of, reverse_of = defaultdict(list), {}
+    for d in decoys:
+        (shuffles_of[d.parent].append(d) if d.kind == "shuffle"
+         else reverse_of.__setitem__(d.parent, d))
+
+    summary, fields = [], ["peptide_id", "peptide", "length"]
+    for p in real:
+        row = {"peptide_id": p.name, "peptide": p.seq, "length": len(p.seq)}
+        for name, s in searchers.items():
+            E, E_naive = s.expected(p)
+            k = sum(s.counts[d.qid] > 0 for d in shuffles_of[p.qid])
+            n = len(shuffles_of[p.qid])
+            rev = reverse_of.get(p.qid)
+            row.update({
+                f"{name}_hits": int(s.counts[p.qid]),
+                f"{name}_expected_random": f"{E:.3g}",
+                f"{name}_expected_naive": f"{E_naive:.3g}",
+                f"{name}_p_chance_match": f"{-math.expm1(-E):.3g}",
+                f"{name}_shuffle_hits": f"{k}/{n}" if n else "NA",
+                f"{name}_empirical_p": f"{(k + 1) / (n + 1):.3g}" if n else "NA",
+                f"{name}_reverse_hits": int(s.counts[rev.qid]) if rev else "NA",
+            })
+        target = [s for nme, s in searchers.items() if nme != "host"]
+        support = [r["context_support"] for s in target for r in s.rows
+                   if r["_qid"] == p.qid]
+        row["best_context_support"] = max(support) if support else ""
+        if "proteome" in searchers and row["proteome_hits"]:
+            status = "in_predicted_proteome"
+        elif "genome" in searchers and row["genome_hits"]:
+            status = ("genome_only" if "proteome" in searchers
+                      else "in_genome")
+        else:
+            status = "not_found"
+        if "host" in searchers and row["host_hits"]:
+            status += ";ALSO_IN_HOST"
+        row["status"] = status
+        summary.append(row)
+    for name in searchers:
+        fields += [f"{name}_{c}" for c in (
+            "hits", "expected_random", "expected_naive", "p_chance_match",
+            "shuffle_hits", "empirical_p", "reverse_hits")]
+    fields += ["best_context_support", "status"]
+    write_tsv(f"{args.out}.peptide_summary.tsv", summary, fields)
+
+    # ---- null by length
+    null_rows = []
+    for name, s in searchers.items():
+        null_rows += null_table(name, queries, s.counts)
+    write_tsv(f"{args.out}.null_by_length.tsv", null_rows,
+              ["database", "length", "n_peptides", "real_hit_rate",
+               "reverse_hit_rate", "shuffle_hit_rate_mean",
+               "shuffle_hit_rate_min", "shuffle_hit_rate_max"])
+
+    # ---- run information (inputs, checksums, settings, versions)
+    inputs = [("peptides", args.peptides)] + [(n, p) for n, p, f in dbs]
+    write_run_info(f"{args.out}.run_info.txt", args, inputs, seq_counts,
+                   searchers, len(real), len(decoys))
+
+    # ---- console summary
+    print("\nHit rate (fraction of peptides with >=1 exact match):")
+    for r in null_rows:
+        if r["length"] == "all":
+            print(f"  {r['database']:9s} real={r['real_hit_rate']}  "
+                  f"reversed={r['reverse_hit_rate']}  "
+                  f"shuffled={r['shuffle_hit_rate_mean']} "
+                  f"({r['shuffle_hit_rate_min']}-{r['shuffle_hit_rate_max']})")
+    counts = defaultdict(int)
+    for r in summary:
+        counts[r["status"]] += 1
+    print("\nStatus:", dict(counts))
+    print(f"\nWrote {args.out}.hits.tsv, .peptide_summary.tsv, "
+          ".null_by_length.tsv and .run_info.txt")
+
+
+if __name__ == "__main__":
+    main()
