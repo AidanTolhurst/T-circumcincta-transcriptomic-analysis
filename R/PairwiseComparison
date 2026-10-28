@@ -5,12 +5,36 @@ library(ComplexHeatmap)
 library(circlize)
 library(grid)
 
-#Parameter definition
-INPUT_FILE <- ("data", "merged_data.xlsx")  # output of the Python merge script
+# ---- Parameter definition ---------------------------------------------------
+# DATA PROVENANCE
+#   Input:   T-Circumcincta-Transcriptomic-Dataset.xlsx
+#   Archive: Zenodo, https://doi.org/10.5281/zenodo.23746703
+#   Place the file in the folder R is working from (check with getwd()).
+ 
+INPUT_FILE <- "T-Circumcincta-Transcriptomic-Dataset.xlsx"
 SHEET_NAME <- "Sheet1"
 ID_COL     <- "gene_id"
-
-
+ 
+ZENODO_DOI <- "10.5281/zenodo.23746703"
+INPUT_MD5  <- "3154a00cebc4ccfda21a06fc3a3489db"
+ 
+options(warn = 1)   # show warnings as they happen, not at the end
+ 
+# ---- Check the data before doing any work -----------------------------------
+if (!file.exists(INPUT_FILE)) {
+  stop("Input file not found: ", INPUT_FILE,
+       "\nDownload it from https://doi.org/", ZENODO_DOI,
+       " and place it in the working folder: ", getwd())
+}
+ 
+actual_md5  <- unname(tools::md5sum(INPUT_FILE))
+md5_matches <- identical(tolower(actual_md5), tolower(INPUT_MD5))
+if (!md5_matches) {
+  warning(INPUT_FILE, " does not match the archived Zenodo version ",
+          "(checksum differs). Results may not be reproducible.")
+}
+ 
+#Data Extraction
 STAGE_COMPARISONS <- c("L3_v_xL3", "xL3_v_L4", "L4_v_aMale", "L4_v_aFemale")
 STAGE_LABELS       <- c("L3 vs xL3", "xL3 vs L4", "L4 vs aMale", "L4 vs aFemale")
 LOG2FC_COLS        <- paste0("log2FoldChange_", STAGE_COMPARISONS)
@@ -19,20 +43,16 @@ AMP_PREDICTOR_COLS  <- c("ampir prob_AMP", "multipep antimicrobial", "multipep a
 PREDICTOR_LABELS    <- c("ampir\n(prob_AMP)", "multipep\n(antimicrobial)", "multipep\n(antibacterial)")
 PREDICTOR_THRESHOLD <- 0  #Threshold for cell colouration
 
+#Figure Construction
 ROW_FILTER_THRESHOLD <- 0.9  #Threshold for gene inclusion
 PLOT_TITLE  <- "Pairwise comparison of transcriptomics across life stages of T. circumcincta"
-
-
 OUTPUT_FILE <- paste0("Heatmap_pairwise_rowfilter", ROW_FILTER_THRESHOLD, "_", .tag, ".pdf")
-
 FONT_FAMILY <- "Helvetica"     
-
 STANDARD_COLUMN_WIDTHS_IN <- c("1 column" = 3.5, "1.5 column" = 5, "2 column" = 7.2)
 MAX_FIGURE_HEIGHT_IN <- 6  
 
-#Loading data
-df <- read_excel(INPUT_FILE, sheet = SHEET_NAME)
 
+df <- read_excel(INPUT_FILE, sheet = SHEET_NAME)
 cat("Loaded", nrow(df), "rows.\n")
 cat("Columns:", paste(colnames(df), collapse = ", "), "\n\n")
 cat("Stage labels: S1 =", STAGE_COMPARISONS[1], ", S2 =", STAGE_COMPARISONS[2],
