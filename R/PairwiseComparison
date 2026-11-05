@@ -10,14 +10,6 @@
 # Needs: R >= 4.0 and the packages readxl, dplyr, ComplexHeatmap, circlize, grid.
 # =============================================================================
 
-
-#Library calls
-library(readxl)
-library(dplyr)
-library(ComplexHeatmap)
-library(circlize)
-library(grid)
-
 # ---- Parameter definition ---------------------------------------------------
 # DATA PROVENANCE
 #   Input:   T-Circumcincta-Transcriptomic-Dataset.xlsx
