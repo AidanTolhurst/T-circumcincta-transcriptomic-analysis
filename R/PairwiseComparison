@@ -1,3 +1,16 @@
+# =============================================================================
+#   1. Exact string matching of peptides against a protein FASTA (proteome),
+#      a six-frame translation of a genome FASTA, and a host proteome.
+#   2. Chance of a random match from database size and residue composition,
+#      plus an empirical null from reversed and shuffled copies of each peptide.
+#   3. Structural context of each hit (cleavage sites, amidation Gly,
+#      crude signal-like N-terminus).
+#   4. Three figures (fig1-3) and one Excel summary table, written to OUT_DIR.
+#
+# Needs: R >= 4.0 and the packages readxl, dplyr, ComplexHeatmap, circlize, grid.
+# =============================================================================
+
+
 #Library calls
 library(readxl)
 library(dplyr)
