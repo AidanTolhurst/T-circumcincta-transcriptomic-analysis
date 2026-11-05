@@ -14,15 +14,22 @@ This repository contains reproducible R scripts for generating publication-ready
 - `TrajectoryComparison.R`  
   Relative-expression trajectory heatmap for AMP-predicted genes across the developmental series.
 
+- `LocalPeptideBlast.R`  
+  Peptide blast against the host proteome, and parasite genome and proteome, specialised for short, potentially modified AMPs.
+
 ## Requirements
 
 - R (>= 4.0)
 - R packages:
   - `readxl`
+  - `writexl`
   - `dplyr`
+  - `readr`
   - `ComplexHeatmap`
   - `circlize`
   - `grid`
+  - `ggplot2`
+ 
 
 ## Data
 Archived on Zenodo: https://doi.org/10.5281/zenodo.23746703
