@@ -10,7 +10,7 @@
 # Needs: R >= 4.0 and the packages readr, dplyr, tidyr, ggplot2, writexl..
 # =============================================================================
 
-# ---- Settings ---------------------------------------------------------------
+# ---- Executable Code ---------------------------------------------------------------
 DATA_DIR   <- "" #To be set to your own directory
 PEPTIDES   <- file.path(DATA_DIR, "AASequences.csv")     # one column: pepseq
 PEP_COLUMN <- "pepseq"
@@ -33,7 +33,7 @@ suppressPackageStartupMessages({
 options(warn = 1)
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
-# ---- Constants --------------------------------------------------------------
+# Constants
 MAX_K    <- 12L                      # longest key; longer peptides are verified in full
 AA_ORDER <- "ACDEFGHKLMNPQRSTVWY"    # 19 letters: I is merged into L
 AA_CODE  <- integer(256)             # 0 for '*', 'X' and anything else
@@ -52,7 +52,7 @@ KD <- c(A = 1.8, R = -4.5, N = -3.5, D = -3.5, C = 2.5, Q = -3.5, E = -3.5, G = 
         H = -3.2, I = 4.5, L = 3.8, K = -3.9, M = 1.9, F = 2.8, P = -1.6, S = -0.8,
         T = -0.7, W = -0.9, Y = -1.3, V = 4.2)
 
-# ---- Input checks and FASTA streaming ---------------------------------------
+# Input checks and FASTA streaming
 check_fasta <- function(path, kind) {
   if (!file.exists(path)) stop("File not found: ", path, call. = FALSE)
   tryCatch({
@@ -93,7 +93,7 @@ stream_fasta <- function(path, fn, block_lines = 300000L) {
   }
 }
 
-# ---- Peptides and decoys ----------------------------------------------------
+# Peptides and decoys
 squash <- function(x) gsub("[^a-z0-9]", "", tolower(x))
 
 load_peptides <- function(path, column) {
@@ -156,7 +156,7 @@ build_queries <- function(pep, n_shuffles) {
   Q
 }
 
-# ---- Structural context of a hit (positions are 1-based, inclusive) ---------
+# Structural context of a hit (positions are 1-based, inclusive)
 signal_like <- function(segment, hit_offset) {
   m <- regexpr("M", segment, fixed = TRUE)[1] - 1L          # 0-based, -1 if no Met
   if (m < 0L || hit_offset - m < 20L) return(FALSE)
@@ -188,7 +188,7 @@ hit_context <- function(hay, s, e) {
          (c_site %in% c("dibasic", "monobasic") || amid %in% c("G+dibasic", "G+monobasic")) + sig)
 }
 
-# ---- Exact-match search engine ----------------------------------------------
+# Exact-match search engine
 # codes: integer residue codes (0 = separator/stop/unknown). Each window is turned
 # into a base-20 number, looked up among the queries' keys, and long peptides are
 # then checked in full. Returns data.frame(qid, pos) for every query, decoys included.
@@ -313,7 +313,7 @@ scan_genome <- function(path, Q, st) {
   })
 }
 
-# ---- Run --------------------------------------------------------------------
+# Run
 DBS <- Filter(Negate(is.null), list(proteome = PROTEOME, genome = GENOME, host = HOST))
 if (!length(DBS)) stop("Set at least one of PROTEOME, GENOME, HOST.")
 for (d in names(DBS)) check_fasta(DBS[[d]], if (d == "genome") "dna" else "protein")  # fail fast
@@ -335,11 +335,11 @@ for (d in names(DBS)) {
           round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), " min")
 }
 
-# ---- Hits table -------------------------------------------------------------
+# Hits table
 hits <- bind_rows(lapply(names(ST), function(d)
   if (length(ST[[d]]$rows)) bind_rows(ST[[d]]$rows) %>% mutate(database = d)))
 if (!nrow(hits)) hits <- tibble(database = character(), qid = integer(), context_support = numeric())
-# ---- Per-peptide summary ----------------------------------------------------
+# Per-peptide summary
 real <- seq_len(R); shuf <- which(Q$kind == "shuffle"); revq <- which(Q$kind == "reverse")
 summ <- tibble(peptide_id = pep$name, peptide = pep$seq, length = Q$len[real])
 for (d in names(ST)) {
@@ -365,7 +365,7 @@ summ$status <- ifelse(found("proteome"), "in_predicted_proteome",
                       ifelse(found("genome"), genome_label, "not_found"))
 summ$status <- ifelse(found("host"), paste0(summ$status, ";ALSO_IN_HOST"), summ$status)
 
-# ---- Overall hit rates: real vs reversed vs shuffled ------------------------
+# Overall hit rates: real vs reversed vs shuffled 
 Qlite <- data.frame(qid = seq_len(Q$n), kind = Q$kind, rep = Q$rep)
 null_table <- function(db, counts) {
   d <- mutate(Qlite, hit = counts[qid] > 0)
@@ -379,7 +379,7 @@ null_table <- function(db, counts) {
 }
 null <- bind_rows(lapply(names(ST), function(d) null_table(d, ST[[d]]$counts)))
 
-# ---- Evidence table ---------------------------------------------------------
+# Evidence table
 weak <- Reduce(`|`, lapply(intersect(c("proteome", "genome"), names(ST)), function(d)
   summ[[paste0(d, "_hits")]] > 0 & summ[[paste0(d, "_p_chance_match")]] > P_THRESHOLD), FALSE)
 evidence <- summ %>%
@@ -389,11 +389,11 @@ evidence <- summ %>%
   rename(any_of(c(proteome_p = "proteome_p_chance_match", genome_p = "genome_p_chance_match"))) %>%
   mutate(weak_by_chance = weak)
 
-# ---- Excel summary table ----------------------------------------------------
+# Excel summary table
 xlsx_path <- file.path(OUT_DIR, paste0(PREFIX, "_summary_table.xlsx"))
 write_xlsx(list(peptide_evidence = evidence), xlsx_path)
 
-# ---- Figures ----------------------------------------------------------------
+# Figures 
 db_labels <- c(proteome = "Nematoda proteins", genome = "T. circumcincta genome (six-frame)",
                host = "Sheep proteins")
 db_label  <- function(x) factor(db_labels[x], levels = db_labels)
