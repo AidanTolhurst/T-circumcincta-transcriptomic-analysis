@@ -1,11 +1,14 @@
-#Library calls
-library(readxl)
-library(dplyr)
-library(ComplexHeatmap)
-library(circlize)
-library(grid)
+# =============================================================================
+#   1. Extracts pairwise transcriptomic data from publically avaliable dataset
+#   2. Maps transcriptomic analysis of peptides present in all life stages
+#   3. Generates a figure showcasing normalisedtranscriptional comparisons across
+#      all lifestages and ampir/Multipep output in both .pdf and .jpeg files.
+#
+# Requires: R >= 4.0 and the packages readxl, dplyr, ComplexHeatmap, circlize, grid.
+# =============================================================================
 
-# ---- Parameter definition ---------------------------------------------------
+# ---- Executable Code ---------------------------------------------------
+
 # DATA PROVENANCE
 #   Input:   T-Circumcincta-Transcriptomic-Dataset.xlsx
 #   Archive: Zenodo, https://doi.org/10.5281/zenodo.23746703
@@ -20,7 +23,7 @@ INPUT_MD5  <- "3154a00cebc4ccfda21a06fc3a3489db"
  
 options(warn = 1)   # show warnings as they happen, not at the end
  
-# ---- Check the data before doing any work -----------------------------------
+# Validating File Presence
 if (!file.exists(INPUT_FILE)) {
   stop("Input file not found: ", INPUT_FILE,
        "\nDownload it from https://doi.org/", ZENODO_DOI,
