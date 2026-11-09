@@ -14,24 +14,19 @@
 DATA_DIR   <- "" #To be set to your own directory
 PEPTIDES   <- file.path(DATA_DIR, "AASequences.csv")     # one column: pepseq
 PEP_COLUMN <- "pepseq"
-PROTEOME   <- file.path(DATA_DIR, "Nematoda_proteins.fasta")
-GENOME     <- file.path(DATA_DIR, "teladorsagia_circumcincta_genome.fa")
-HOST       <- file.path(DATA_DIR, "Ovis_aries_proteins.fasta")
+PROTEOME   <- file.path(DATA_DIR, "Nematoda_proteins.fasta") #downloadable from https://www.uniprot.org/taxonomy/6231
+GENOME     <- file.path(DATA_DIR, "teladorsagia_circumcincta_genome.fa") #downloadable from https://parasite.wormbase.org/Teladorsagia_circumcincta_prjna72569/Info/Index/
+HOST       <- file.path(DATA_DIR, "Ovis_aries_proteins.fasta") #downloadable from https://www.uniprot.org/taxonomy/9940
 OUT_DIR    <- file.path(DATA_DIR, "results")
 PREFIX     <- "nematoda_map"
 
 
-N_SHUFFLES  <- 100     # shuffled decoys per peptide (0 = none)
+N_SHUFFLES  <- 100     # shuffled decoys per peptide
 SEED        <- 1
 MAX_HITS    <- 1000    # max hit rows kept per peptide per database
 FLANK       <- 4       # residues reported either side of a hit
-P_THRESHOLD <- 0.001   # rule of thumb for "unlikely by chance", not a formal test
+P_THRESHOLD <- 0.05 / 90   # Bonferonni correction for number of peptides
 
-suppressPackageStartupMessages({
-  library(readr); library(dplyr); library(tidyr); library(ggplot2); library(writexl)
-})
-options(warn = 1)
-dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # Constants
 MAX_K    <- 12L                      # longest key; longer peptides are verified in full
@@ -156,7 +151,7 @@ build_queries <- function(pep, n_shuffles) {
   Q
 }
 
-# Structural context of a hit (positions are 1-based, inclusive)
+# Structural context of a hit (positions are 1-based, inclusive) 
 signal_like <- function(segment, hit_offset) {
   m <- regexpr("M", segment, fixed = TRUE)[1] - 1L          # 0-based, -1 if no Met
   if (m < 0L || hit_offset - m < 20L) return(FALSE)
@@ -313,7 +308,7 @@ scan_genome <- function(path, Q, st) {
   })
 }
 
-# Run
+# Run 
 DBS <- Filter(Negate(is.null), list(proteome = PROTEOME, genome = GENOME, host = HOST))
 if (!length(DBS)) stop("Set at least one of PROTEOME, GENOME, HOST.")
 for (d in names(DBS)) check_fasta(DBS[[d]], if (d == "genome") "dna" else "protein")  # fail fast
@@ -379,7 +374,7 @@ null_table <- function(db, counts) {
 }
 null <- bind_rows(lapply(names(ST), function(d) null_table(d, ST[[d]]$counts)))
 
-# Evidence table
+# Evidence table 
 weak <- Reduce(`|`, lapply(intersect(c("proteome", "genome"), names(ST)), function(d)
   summ[[paste0(d, "_hits")]] > 0 & summ[[paste0(d, "_p_chance_match")]] > P_THRESHOLD), FALSE)
 evidence <- summ %>%
@@ -393,12 +388,19 @@ evidence <- summ %>%
 xlsx_path <- file.path(OUT_DIR, paste0(PREFIX, "_summary_table.xlsx"))
 write_xlsx(list(peptide_evidence = evidence), xlsx_path)
 
-# Figures 
+# Figures
 db_labels <- c(proteome = "Nematoda proteins", genome = "T. circumcincta genome (six-frame)",
                host = "Sheep proteins")
 db_label  <- function(x) factor(db_labels[x], levels = db_labels)
 group_col <- c(Real = "#0072B2", Reversed = "#E69F00", Shuffled = "#999999")
-theme_set(theme_classic(base_size = 12))
+FONT <- "Helvetica"
+theme_set(theme_classic(base_size = 12, base_family = FONT))
+update_geom_defaults("text", list(family = FONT))        # numbers printed on the bars
+if (requireNamespace("systemfonts", quietly = TRUE) &&
+    !(FONT %in% systemfonts::system_fonts()$family))
+  message("Note: ", FONT, " is not installed on this computer (Windows does not include it), ",
+          "so PNG text falls back to the closest sans-serif font, usually Arial. ",
+          "The PDFs name Helvetica directly.")
 save_fig <- function(plot, name, w = 7, h = 4.5) {
   ggsave(file.path(OUT_DIR, paste0(name, ".png")), plot, width = w, height = h, dpi = 300)
   ggsave(file.path(OUT_DIR, paste0(name, ".pdf")), plot, width = w, height = h)
@@ -419,8 +421,7 @@ fig1 <- ggplot(overall, aes(database, rate, fill = group)) +
             position = position_dodge(0.8), vjust = -0.5, size = 3, na.rm = TRUE) +
   scale_fill_manual(values = group_col, name = NULL) +
   scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.08))) +
-  labs(x = NULL, y = "Peptides with at least one exact match",
-       caption = "Shuffled: mean of replicate sets; bars show min to max.") +
+  labs(x = NULL, y = "Proportion of peptides with ≥1 exact match(es)") +
   theme(axis.text.x = element_text(angle = 15, hjust = 1))
 save_fig(fig1, "fig1_hit_rate_vs_decoys")
 
@@ -436,9 +437,9 @@ if (nrow(evid)) {
     geom_hline(yintercept = -log10(P_THRESHOLD), linetype = "dashed") +
     geom_point(size = 2, alpha = 0.85) +
     facet_wrap(~database, ncol = 1) +
-    scale_colour_viridis_d(name = "Context\nsupport", drop = FALSE) +
-    labs(x = "Peptide length (residues)", y = expression(-log[10]~"(chance of a random match)"),
-         caption = sprintf("Dashed line: p = %g (rule of thumb). Peptides below it need caution.", P_THRESHOLD))
+    scale_colour_viridis_d(name = "Context\nsupport", drop = TRUE) +
+    labs(x = "Peptide length (residues)", y = "-log10 (chance of a random match)",
+         caption = sprintf("Dashed line: p = %g", P_THRESHOLD))
   save_fig(fig2, "fig2_chance_of_random_match", h = 6.5)
 } else message("No peptide has a hit in the proteome or genome: figure 2 skipped.")
 
@@ -451,13 +452,17 @@ ctx_tbl <- summ %>% filter(!is.na(best_context_support)) %>%
   count(where, support)
 if (nrow(ctx_tbl)) {
   fig3 <- ggplot(ctx_tbl, aes(support, n, fill = where)) +
-    geom_col(position = position_dodge(0.8), width = 0.7) +
-    scale_fill_manual(values = c("#0072B2", "#E69F00", "#009E73"), name = NULL) +
-    scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
-    labs(x = "Context support (0 to 3)", y = "Number of peptides",
-         caption = "One point each: cleavage site before, cleavage site after, signal-like N-terminus.")
-  save_fig(fig3, "fig3_context_support")
-} else message("No peptide has context information: figure 3 skipped.")
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n, colour = where), position = position_stack(vjust = 0.5), size = 4) +
+    scale_fill_manual(values = c("In Nematoda proteins" = "#0072B2", "Genome only" = "#E69F00",
+                                 "In genome" = "#009E73"), name = NULL) +
+    scale_colour_manual(values = c("In Nematoda proteins" = "white", "Genome only" = "black",
+                                   "In genome" = "white"), guide = "none") +
+    scale_x_discrete(drop = TRUE) +                       
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       breaks = function(l) seq(0, ceiling(l[2]), by = max(1, ceiling(l[2] / 8)))) +
+    labs(x = "Context support", y = "Number of peptides",)
+}
 
 message("Peptides: ", R, " | hit but weak by chance (p > ", P_THRESHOLD, "): ", sum(weak, na.rm = TRUE),
         " | also in sheep: ", sum(found("host")))
